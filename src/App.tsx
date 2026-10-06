@@ -90,6 +90,28 @@ function sanitizeFileName(raw: string): string {
   return cleaned || 'voice_atelier_reading';
 }
 
+async function parseApiResponse(response: Response) {
+  const rawText = await response.text();
+  let data: any = null;
+  try {
+    data = rawText ? JSON.parse(rawText) : {};
+  } catch {
+    if (response.status === 404 || rawText.includes('The page could not be found')) {
+      throw new Error(
+        '음성 합성 API 경로(/api/tts)를 찾을 수 없습니다(404). 외부 호스팅(Vercel 등)에 배포하신 경우 최신 코드(/api 폴더 포함)로 재배포하고 환경 변수에 GEMINI_API_KEY를 등록해 주세요.'
+      );
+    }
+    throw new Error(
+      `서버에서 올바른 응답을 받지 못했습니다 (HTTP ${response.status}). 잠시 후 다시 시도해 주세요.`
+    );
+  }
+
+  if (!response.ok) {
+    throw new Error(data?.error || `음성 합성 요청 실패 (HTTP ${response.status})`);
+  }
+  return data;
+}
+
 export default function App() {
   // Navigation & Mode
   const [studioMode, setStudioMode] = useState<'single' | 'multi'>('single');
@@ -268,10 +290,7 @@ export default function App() {
         }),
       });
 
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error || '샘플 오디오 생성에 실패했습니다.');
-      }
+      const data = await parseApiResponse(response);
 
       const mp3Url = base64ToBlobUrl(data.mp3Base64, 'audio/mpeg');
       if (previewAudioRef.current) {
@@ -322,10 +341,7 @@ export default function App() {
           }),
         });
 
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(data.error || '음성 합성에 실패했습니다.');
-        }
+        const data = await parseApiResponse(response);
 
         const mp3Url = base64ToBlobUrl(data.mp3Base64, 'audio/mpeg');
         const wavUrl = base64ToBlobUrl(data.wavBase64, 'audio/wav');
@@ -394,10 +410,7 @@ export default function App() {
           }),
         });
 
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(data.error || '멀티 보이스 합성에 실패했습니다.');
-        }
+        const data = await parseApiResponse(response);
 
         const mp3Url = base64ToBlobUrl(data.mp3Base64, 'audio/mpeg');
         const wavUrl = base64ToBlobUrl(data.wavBase64, 'audio/wav');
