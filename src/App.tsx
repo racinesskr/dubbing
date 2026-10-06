@@ -283,7 +283,10 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           text: voice.sampleLine,
+          voiceId: voice.id,
           baseVoice: voice.baseVoice,
+          emotionId: selectedEmotion.id,
+          speedId: selectedSpeed.id,
           stylePrompt: voice.stylePrompt,
           tonePrompt: selectedEmotion.prompt,
           speedPrompt: selectedSpeed.prompt,
@@ -334,7 +337,10 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             text: manuscriptText,
+            voiceId: selectedVoice.id,
             baseVoice: selectedVoice.baseVoice,
+            emotionId: selectedEmotion.id,
+            speedId: selectedSpeed.id,
             stylePrompt: selectedVoice.stylePrompt,
             tonePrompt: selectedEmotion.prompt,
             speedPrompt: selectedSpeed.prompt,
@@ -344,7 +350,9 @@ export default function App() {
         const data = await parseApiResponse(response);
 
         const mp3Url = base64ToBlobUrl(data.mp3Base64, 'audio/mpeg');
-        const wavUrl = base64ToBlobUrl(data.wavBase64, 'audio/wav');
+        const wavUrl = data.wavBase64
+          ? base64ToBlobUrl(data.wavBase64, 'audio/wav')
+          : '';
         const titleText =
           manuscriptTitle.trim() ||
           manuscriptText.trim().slice(0, 22).replace(/\s+/g, ' ');
@@ -394,7 +402,10 @@ export default function App() {
               EMOTION_OPTIONS[0];
             return {
               text: s.text.trim(),
+              voiceId: v.id,
               baseVoice: v.baseVoice,
+              emotionId: em.id,
+              speedId: selectedSpeed.id,
               stylePrompt: v.stylePrompt,
               tonePrompt: em.prompt,
               speedPrompt: selectedSpeed.prompt,
@@ -413,7 +424,9 @@ export default function App() {
         const data = await parseApiResponse(response);
 
         const mp3Url = base64ToBlobUrl(data.mp3Base64, 'audio/mpeg');
-        const wavUrl = base64ToBlobUrl(data.wavBase64, 'audio/wav');
+        const wavUrl = data.wavBase64
+          ? base64ToBlobUrl(data.wavBase64, 'audio/wav')
+          : '';
         const combinedScript = segments.map((s) => s.text.trim()).join('\n\n');
         const uniqueVoiceNames = Array.from(
           new Set(
@@ -490,13 +503,55 @@ export default function App() {
     setCurrentTime(audio.currentTime);
   };
 
-  const handleDownloadTrack = (track: GeneratedTrack, format: 'mp3' | 'wav') => {
-    const link = document.createElement('a');
-    link.href = format === 'mp3' ? track.mp3Url : track.wavUrl;
+  const handleDownloadTrack = async (track: GeneratedTrack, format: 'mp3' | 'wav') => {
     const base =
       track.id === activeTrack?.id && customFileName.trim()
         ? sanitizeFileName(customFileName)
         : sanitizeFileName(`${track.title}_${track.voiceName}`);
+
+    let downloadUrl = format === 'mp3' ? track.mp3Url : track.wavUrl;
+
+    if (format === 'wav' && !downloadUrl) {
+      try {
+        const res = await fetch(track.mp3Url);
+        const arrayBuf = await res.arrayBuffer();
+        const audioCtx = new AudioContext();
+        const audioBuf = await audioCtx.decodeAudioData(arrayBuf);
+        const channelData = audioBuf.getChannelData(0);
+        const sampleRate = audioBuf.sampleRate;
+        const wavBytes = new ArrayBuffer(44 + channelData.length * 2);
+        const view = new DataView(wavBytes);
+        const writeStr = (offset: number, str: string) => {
+          for (let i = 0; i < str.length; i++) {
+            view.setUint8(offset + i, str.charCodeAt(i));
+          }
+        };
+        writeStr(0, 'RIFF');
+        view.setUint32(4, 36 + channelData.length * 2, true);
+        writeStr(8, 'WAVE');
+        writeStr(12, 'fmt ');
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, 1, true);
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, sampleRate * 2, true);
+        view.setUint16(32, 2, true);
+        view.setUint16(34, 16, true);
+        writeStr(36, 'data');
+        view.setUint32(40, channelData.length * 2, true);
+        for (let i = 0; i < channelData.length; i++) {
+          const s = Math.max(-1, Math.min(1, channelData[i]));
+          view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+        }
+        await audioCtx.close();
+        downloadUrl = URL.createObjectURL(new Blob([wavBytes], { type: 'audio/wav' }));
+      } catch {
+        downloadUrl = track.mp3Url;
+      }
+    }
+
+    const link = document.createElement('a');
+    link.href = downloadUrl;
     link.download = `${base}.${format}`;
     document.body.appendChild(link);
     link.click();

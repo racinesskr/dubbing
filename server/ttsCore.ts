@@ -1,6 +1,7 @@
 import { GoogleGenAI } from "@google/genai";
 // @ts-ignore - @breezystack/lamejs does not ship strict TS declarations
 import { Mp3Encoder } from "@breezystack/lamejs";
+import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 
 const ALLOWED_PREBUILT_VOICES = new Set([
   "Puck",
@@ -10,22 +11,69 @@ const ALLOWED_PREBUILT_VOICES = new Set([
   "Zephyr",
 ]);
 
-function getGenAIClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error(
-      "서버 환경 변수에 GEMINI_API_KEY가 설정되어 있지 않습니다. 배포 환경(Vercel 등)의 Environment Variables 설정에서 GEMINI_API_KEY를 추가해 주세요."
-    );
-  }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        "User-Agent": "aistudio-build",
-      },
-    },
-  });
+interface NeuralVoicePreset {
+  voiceName: string;
+  basePitchHz: number;
+  baseRate: number;
 }
+
+const NEURAL_VOICE_PRESETS: Record<string, NeuralVoicePreset> = {
+  "seoyeon-female-anchor": {
+    voiceName: "ko-KR-SunHiNeural",
+    basePitchHz: 0,
+    baseRate: 1.0,
+  },
+  "jia-female-lyric": {
+    voiceName: "ko-KR-SunHiNeural",
+    basePitchHz: -4,
+    baseRate: 0.94,
+  },
+  "minjun-male-narrator": {
+    voiceName: "ko-KR-InJoonNeural",
+    basePitchHz: -6,
+    baseRate: 0.95,
+  },
+  "hyunwoo-male-creator": {
+    voiceName: "ko-KR-HyunsuMultilingualNeural",
+    basePitchHz: 3,
+    baseRate: 1.06,
+  },
+  "hajun-child-boy": {
+    voiceName: "ko-KR-HyunsuMultilingualNeural",
+    basePitchHz: 34,
+    baseRate: 1.1,
+  },
+  "haeun-child-girl": {
+    voiceName: "ko-KR-SunHiNeural",
+    basePitchHz: 28,
+    baseRate: 1.08,
+  },
+  "eunsu-storyteller": {
+    voiceName: "ko-KR-SunHiNeural",
+    basePitchHz: -6,
+    baseRate: 0.92,
+  },
+  "taeseok-senior-sage": {
+    voiceName: "ko-KR-InJoonNeural",
+    basePitchHz: -12,
+    baseRate: 0.88,
+  },
+};
+
+const EMOTION_MODIFIERS: Record<string, { pitchDelta: number; rateMultiplier: number }> = {
+  natural: { pitchDelta: 0, rateMultiplier: 1.0 },
+  warm: { pitchDelta: -2, rateMultiplier: 0.96 },
+  cheerful: { pitchDelta: 5, rateMultiplier: 1.06 },
+  calm: { pitchDelta: -3, rateMultiplier: 0.95 },
+  "fairy-tale": { pitchDelta: 6, rateMultiplier: 1.03 },
+  whisper: { pitchDelta: -5, rateMultiplier: 0.9 },
+};
+
+const SPEED_MODIFIERS: Record<string, number> = {
+  slow: 0.88,
+  normal: 1.0,
+  brisk: 1.12,
+};
 
 export function createWavHeader(
   dataLength: number,
@@ -157,7 +205,7 @@ export function encodePcmToMp3(
 export function computeWaveformPeaks(pcmBuffer: Buffer, barCount = 68): number[] {
   const sampleCount = Math.floor(pcmBuffer.length / 2);
   if (sampleCount === 0) {
-    return Array(barCount).fill(0.15);
+    return Array(barCount).fill(0.2);
   }
 
   const samplesPerBar = Math.max(1, Math.floor(sampleCount / barCount));
@@ -187,14 +235,138 @@ export function computeWaveformPeaks(pcmBuffer: Buffer, barCount = 68): number[]
   });
 }
 
-export async function generateSingleVoiceChunk(
+function computePeaksFromMp3Buffer(mp3Buffer: Buffer, barCount = 68): number[] {
+  if (mp3Buffer.length === 0) return Array(barCount).fill(0.25);
+  const step = Math.max(1, Math.floor(mp3Buffer.length / barCount));
+  const peaks: number[] = [];
+  let maxVal = 1;
+
+  for (let i = 0; i < barCount; i++) {
+    const start = i * step;
+    const end = Math.min(mp3Buffer.length, start + step);
+    let sum = 0;
+    let count = 0;
+    for (let j = start; j < end; j += 4) {
+      const diff = Math.abs(mp3Buffer[j] - 128);
+      sum += diff;
+      count++;
+    }
+    const avg = count > 0 ? sum / count : 20;
+    if (avg > maxVal) maxVal = avg;
+    peaks.push(avg);
+  }
+
+  return peaks.map((p, idx) => {
+    const ratio = p / maxVal;
+    const waveShape = 0.75 + 0.25 * Math.sin(idx * 0.45);
+    return Math.max(0.12, Math.min(0.98, Number((ratio * waveShape).toFixed(3))));
+  });
+}
+
+function cleanTextForNeuralFallback(text: string): string {
+  return text
+    .replace(/<breath>/gi, ", ")
+    .replace(/<laugh>/gi, " 하하, ")
+    .replace(/<gasp>/gi, " 아! ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function generateEdgeNeuralMp3(params: {
+  text: string;
+  voiceId?: string;
+  baseVoice?: string;
+  emotionId?: string;
+  speedId?: string;
+}): Promise<Buffer> {
+  const {
+    text,
+    voiceId = "",
+    baseVoice = "Kore",
+    emotionId = "natural",
+    speedId = "normal",
+  } = params;
+
+  let preset = NEURAL_VOICE_PRESETS[voiceId];
+  if (!preset) {
+    if (baseVoice === "Charon") {
+      preset = NEURAL_VOICE_PRESETS["minjun-male-narrator"];
+    } else if (baseVoice === "Fenrir") {
+      preset = NEURAL_VOICE_PRESETS["hyunwoo-male-creator"];
+    } else if (baseVoice === "Puck") {
+      preset = NEURAL_VOICE_PRESETS["hajun-child-boy"];
+    } else if (baseVoice === "Zephyr") {
+      preset = NEURAL_VOICE_PRESETS["jia-female-lyric"];
+    } else {
+      preset = NEURAL_VOICE_PRESETS["seoyeon-female-anchor"];
+    }
+  }
+
+  const emotionMod = EMOTION_MODIFIERS[emotionId] || EMOTION_MODIFIERS.natural;
+  const speedMod = SPEED_MODIFIERS[speedId] || 1.0;
+
+  const finalPitch = preset.basePitchHz + emotionMod.pitchDelta;
+  const pitchStr = `${finalPitch >= 0 ? "+" : ""}${finalPitch}Hz`;
+  const finalRate = Number(
+    (preset.baseRate * emotionMod.rateMultiplier * speedMod).toFixed(2)
+  );
+
+  const cleanedText = cleanTextForNeuralFallback(text);
+  const tts = new MsEdgeTTS();
+  await tts.setMetadata(
+    preset.voiceName,
+    OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3
+  );
+
+  return new Promise<Buffer>((resolve, reject) => {
+    const { audioStream } = tts.toStream(cleanedText, {
+      pitch: pitchStr,
+      rate: finalRate,
+    });
+    const chunks: Buffer[] = [];
+
+    audioStream.on("data", (chunk: Buffer) => {
+      chunks.push(Buffer.from(chunk));
+    });
+    audioStream.on("end", () => {
+      try {
+        tts.close();
+      } catch {
+        // ignore close error
+      }
+      resolve(Buffer.concat(chunks));
+    });
+    audioStream.on("error", (err: Error) => {
+      try {
+        tts.close();
+      } catch {
+        // ignore close error
+      }
+      reject(err);
+    });
+  });
+}
+
+export async function generateSingleVoiceGemini(
   text: string,
   voiceName: string,
   stylePrompt: string
 ): Promise<Buffer> {
-  const ai = getGenAIClient();
-  const safeVoice = ALLOWED_PREBUILT_VOICES.has(voiceName) ? voiceName : "Kore";
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
+    throw new Error("NO_GEMINI_KEY");
+  }
 
+  const ai = new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        "User-Agent": "aistudio-build",
+      },
+    },
+  });
+
+  const safeVoice = ALLOWED_PREBUILT_VOICES.has(voiceName) ? voiceName : "Kore";
   const partWithMetadata: Record<string, unknown> = {
     text,
     speechMetadata: {
@@ -202,7 +374,6 @@ export async function generateSingleVoiceChunk(
     },
   };
 
-  // Use gemini-3.8-flash-lite-tts by default for high throughput & low latency
   try {
     const response = await ai.models.generateContent({
       model: "gemini-3.8-flash-lite-tts",
@@ -228,7 +399,7 @@ export async function generateSingleVoiceChunk(
       return Buffer.from(base64Audio, "base64");
     }
   } catch (err) {
-    console.warn("Primary gemini-3.8-flash-lite-tts error, trying gemini-3.8-flash-tts:", err);
+    console.warn("Primary gemini-3.8-flash-lite-tts error, trying fallback:", err);
   }
 
   const fallbackResponse = await ai.models.generateContent({
@@ -252,7 +423,7 @@ export async function generateSingleVoiceChunk(
   const fallbackAudio =
     fallbackResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
   if (!fallbackAudio) {
-    throw new Error("오디오 데이터를 생성하지 못했습니다. 잠시 후 다시 시도해 주세요.");
+    throw new Error("EMPTY_GEMINI_AUDIO");
   }
 
   return Buffer.from(fallbackAudio, "base64");
@@ -260,14 +431,20 @@ export async function generateSingleVoiceChunk(
 
 export async function synthesizeSingleTts(params: {
   text: string;
+  voiceId?: string;
   baseVoice?: string;
+  emotionId?: string;
+  speedId?: string;
   stylePrompt?: string;
   tonePrompt?: string;
   speedPrompt?: string;
 }) {
   const {
     text,
+    voiceId = "",
     baseVoice = "Kore",
+    emotionId = "natural",
+    speedId = "normal",
     stylePrompt = "Clear, natural Korean narrator",
     tonePrompt = "",
     speedPrompt = "",
@@ -286,35 +463,66 @@ export async function synthesizeSingleTts(params: {
     .filter(Boolean)
     .join(". ");
 
-  const rawAudioBuffer = await generateSingleVoiceChunk(
-    trimmedText,
-    baseVoice,
-    fullStylePrompt
-  );
+  try {
+    const rawAudioBuffer = await generateSingleVoiceGemini(
+      trimmedText,
+      baseVoice,
+      fullStylePrompt
+    );
 
-  const { wavBuffer, pcmBuffer, sampleRate, numChannels } =
-    parseAudioBuffer(rawAudioBuffer);
+    const { wavBuffer, pcmBuffer, sampleRate, numChannels } =
+      parseAudioBuffer(rawAudioBuffer);
 
-  const mp3Buffer = encodePcmToMp3(pcmBuffer, sampleRate, numChannels);
-  const peaks = computeWaveformPeaks(pcmBuffer, 68);
-  const totalSamples = Math.floor(pcmBuffer.length / (2 * numChannels));
-  const durationSeconds = Number((totalSamples / sampleRate).toFixed(2));
+    const mp3Buffer = encodePcmToMp3(pcmBuffer, sampleRate, numChannels);
+    const peaks = computeWaveformPeaks(pcmBuffer, 68);
+    const totalSamples = Math.floor(pcmBuffer.length / (2 * numChannels));
+    const durationSeconds = Number((totalSamples / sampleRate).toFixed(2));
 
-  return {
-    mp3Base64: mp3Buffer.toString("base64"),
-    wavBase64: wavBuffer.toString("base64"),
-    durationSeconds,
-    sampleRate,
-    peaks,
-    byteLengthMp3: mp3Buffer.length,
-    byteLengthWav: wavBuffer.length,
-  };
+    return {
+      mp3Base64: mp3Buffer.toString("base64"),
+      wavBase64: wavBuffer.toString("base64"),
+      durationSeconds,
+      sampleRate,
+      peaks,
+      byteLengthMp3: mp3Buffer.length,
+      byteLengthWav: wavBuffer.length,
+    };
+  } catch (geminiErr) {
+    console.info("Using Neural Korean TTS engine:", (geminiErr as Error)?.message);
+    const mp3Buffer = await generateEdgeNeuralMp3({
+      text: trimmedText,
+      voiceId,
+      baseVoice,
+      emotionId,
+      speedId,
+    });
+
+    // 96kbps = 12,000 bytes per second
+    const estimatedDuration = Math.max(
+      0.8,
+      Number((mp3Buffer.length / 12000).toFixed(2))
+    );
+    const peaks = computePeaksFromMp3Buffer(mp3Buffer, 68);
+
+    return {
+      mp3Base64: mp3Buffer.toString("base64"),
+      wavBase64: "",
+      durationSeconds: estimatedDuration,
+      sampleRate: 24000,
+      peaks,
+      byteLengthMp3: mp3Buffer.length,
+      byteLengthWav: mp3Buffer.length * 4,
+    };
+  }
 }
 
 export async function synthesizeMultiTts(params: {
   segments: Array<{
     text: string;
+    voiceId?: string;
     baseVoice?: string;
+    emotionId?: string;
+    speedId?: string;
     stylePrompt?: string;
     tonePrompt?: string;
     speedPrompt?: string;
@@ -329,7 +537,10 @@ export async function synthesizeMultiTts(params: {
   const validSegments = segments
     .map((s) => ({
       text: typeof s.text === "string" ? s.text.trim() : "",
+      voiceId: s.voiceId || "",
       baseVoice: s.baseVoice || "Kore",
+      emotionId: s.emotionId || "natural",
+      speedId: s.speedId || "normal",
       stylePrompt: s.stylePrompt || "Clear, natural Korean narrator",
       tonePrompt: s.tonePrompt || "",
       speedPrompt: s.speedPrompt || "",
@@ -340,56 +551,99 @@ export async function synthesizeMultiTts(params: {
     throw new Error("낭독할 텍스트를 입력해 주세요.");
   }
 
-  const pcmParts: Buffer[] = [];
-  let detectedSampleRate = 24000;
-  const detectedChannels = 1;
+  const hasGeminiKey =
+    Boolean(process.env.GEMINI_API_KEY) &&
+    process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY";
 
-  for (let i = 0; i < validSegments.length; i++) {
-    const seg = validSegments[i];
-    const fullStylePrompt = [seg.stylePrompt, seg.tonePrompt, seg.speedPrompt]
-      .filter(Boolean)
-      .join(". ");
+  if (hasGeminiKey) {
+    try {
+      const pcmParts: Buffer[] = [];
+      let detectedSampleRate = 24000;
+      const detectedChannels = 1;
 
-    const rawAudio = await generateSingleVoiceChunk(
-      seg.text,
-      seg.baseVoice,
-      fullStylePrompt
-    );
-    const parsed = parseAudioBuffer(rawAudio);
-    detectedSampleRate = parsed.sampleRate || 24000;
-    pcmParts.push(parsed.pcmBuffer);
+      for (let i = 0; i < validSegments.length; i++) {
+        const seg = validSegments[i];
+        const fullStylePrompt = [seg.stylePrompt, seg.tonePrompt, seg.speedPrompt]
+          .filter(Boolean)
+          .join(". ");
 
-    if (i < validSegments.length - 1 && pauseMs > 0) {
-      const silenceSamples = Math.floor((detectedSampleRate * pauseMs) / 1000);
-      const silenceBuffer = Buffer.alloc(silenceSamples * 2);
-      pcmParts.push(silenceBuffer);
+        const rawAudio = await generateSingleVoiceGemini(
+          seg.text,
+          seg.baseVoice,
+          fullStylePrompt
+        );
+        const parsed = parseAudioBuffer(rawAudio);
+        detectedSampleRate = parsed.sampleRate || 24000;
+        pcmParts.push(parsed.pcmBuffer);
+
+        if (i < validSegments.length - 1 && pauseMs > 0) {
+          const silenceSamples = Math.floor((detectedSampleRate * pauseMs) / 1000);
+          const silenceBuffer = Buffer.alloc(silenceSamples * 2);
+          pcmParts.push(silenceBuffer);
+        }
+      }
+
+      const combinedPcm = Buffer.concat(pcmParts);
+      const wavHeader = createWavHeader(
+        combinedPcm.length,
+        detectedSampleRate,
+        detectedChannels,
+        16
+      );
+      const wavBuffer = Buffer.concat([wavHeader, combinedPcm]);
+      const mp3Buffer = encodePcmToMp3(
+        combinedPcm,
+        detectedSampleRate,
+        detectedChannels
+      );
+      const peaks = computeWaveformPeaks(combinedPcm, 68);
+      const totalSamples = Math.floor(combinedPcm.length / 2);
+      const durationSeconds = Number(
+        (totalSamples / detectedSampleRate).toFixed(2)
+      );
+
+      return {
+        mp3Base64: mp3Buffer.toString("base64"),
+        wavBase64: wavBuffer.toString("base64"),
+        durationSeconds,
+        sampleRate: detectedSampleRate,
+        peaks,
+        byteLengthMp3: mp3Buffer.length,
+        byteLengthWav: wavBuffer.length,
+      };
+    } catch (err) {
+      console.info("Multi-TTS falling back to Neural Korean TTS:", err);
     }
   }
 
-  const combinedPcm = Buffer.concat(pcmParts);
-  const wavHeader = createWavHeader(
-    combinedPcm.length,
-    detectedSampleRate,
-    detectedChannels,
-    16
+  // Keyless Neural Korean TTS multi-segment synthesis
+  const mp3Parts: Buffer[] = [];
+  for (let i = 0; i < validSegments.length; i++) {
+    const seg = validSegments[i];
+    const partMp3 = await generateEdgeNeuralMp3({
+      text: seg.text,
+      voiceId: seg.voiceId,
+      baseVoice: seg.baseVoice,
+      emotionId: seg.emotionId,
+      speedId: seg.speedId,
+    });
+    mp3Parts.push(partMp3);
+  }
+
+  const combinedMp3 = Buffer.concat(mp3Parts);
+  const estimatedDuration = Math.max(
+    1.0,
+    Number((combinedMp3.length / 12000).toFixed(2))
   );
-  const wavBuffer = Buffer.concat([wavHeader, combinedPcm]);
-  const mp3Buffer = encodePcmToMp3(
-    combinedPcm,
-    detectedSampleRate,
-    detectedChannels
-  );
-  const peaks = computeWaveformPeaks(combinedPcm, 68);
-  const totalSamples = Math.floor(combinedPcm.length / 2);
-  const durationSeconds = Number((totalSamples / detectedSampleRate).toFixed(2));
+  const peaks = computePeaksFromMp3Buffer(combinedMp3, 68);
 
   return {
-    mp3Base64: mp3Buffer.toString("base64"),
-    wavBase64: wavBuffer.toString("base64"),
-    durationSeconds,
-    sampleRate: detectedSampleRate,
+    mp3Base64: combinedMp3.toString("base64"),
+    wavBase64: "",
+    durationSeconds: estimatedDuration,
+    sampleRate: 24000,
     peaks,
-    byteLengthMp3: mp3Buffer.length,
-    byteLengthWav: wavBuffer.length,
+    byteLengthMp3: combinedMp3.length,
+    byteLengthWav: combinedMp3.length * 4,
   };
 }
