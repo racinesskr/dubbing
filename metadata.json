@@ -1,0 +1,6 @@
+{
+  "name": "보이스 아틀리에 (Voice Atelier) — AI 자연어 낭독 & MP3 스튜디오",
+  "description": "내가 쓴 글을 남성, 여성, 아이 등 다양한 AI 목소리와 감정 톤으로 자연스럽게 읽어주고 고음질 MP3 파일로 다운로드할 수 있는 오디오 제작 스튜디오입니다.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
